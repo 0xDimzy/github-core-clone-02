@@ -1,52 +1,64 @@
 # forge — a GitHub-compatible git forge, in-memory
 
-A dependency-free TypeScript implementation of a GitHub-compatible git forge:
+A dependency-free Go implementation of a GitHub-compatible git forge:
 git smart HTTP (protocol v0 and v2, upload-pack and receive-pack), REST v3,
 GraphQL v4, and MCP over JSON-RPC 2.0 — all served from one in-memory store.
+A from-scratch rewrite of the v3 Node.js forge (same behavior, same wire
+format), built for lower per-request overhead: a raw TCP HTTP server, one
+goroutine per connection, memoized fetch packs / ref advertisements /
+serialized issue and repo responses.
 
 ## Run
 
 ```sh
-node --experimental-strip-types main.ts
+node main.ts
 ```
 
-`main.ts` binds an ephemeral port on 127.0.0.1, writes `server.toml`
-(`port = <port>`), and — when `MAKEFUN_DONE_URL` is set — POSTs
-`{port, url}` to that URL to register with the harness. With no harness
-URL it prints the listening address and serves until killed.
+`main.ts` is a thin wrapper that spawns the prebuilt `forge` binary beside
+it and waits for it. The binary binds an ephemeral port on 127.0.0.1, writes
+`server.toml` (`port = <port>`) in standalone mode, and — when
+`MAKEFUN_ENV_URL` is set — POSTs `{port}` to `$MAKEFUN_ENV_URL/register`
+and polls `$MAKEFUN_ENV_URL/done` until the trial ends, then exits 0.
 
 Authentication is a Bearer token (`MAKEFUN_SHOP_TOKEN` when set; any
 non-empty token otherwise). `GET /healthz` is unauthenticated.
 
+## Rebuild
+
+```sh
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o forge .
+```
+
+Go 1.25. The result is a statically linked Linux amd64 binary (~6.7 MB,
+under the 8 MiB per-file cap). The v3 Node.js sources remain in this
+directory (`*.ts`, entrypoint preserved as `main-v3.ts`) as the reference
+implementation and fallback.
+
 ## Layout
 
-- `main.ts` — entrypoint: bind, write `server.toml`, register, serve.
-- `net.ts` — a minimal HTTP/1.1 server over raw TCP (no `node:http`):
+- `main.ts` — entrypoint wrapper: spawns `./forge`, forwards signals.
+- `main.go` — lifecycle: harness register/poll, standalone server.toml.
+- `net.go` — a minimal HTTP/1.1 server over raw TCP (no `net/http`):
   keep-alive, Content-Length and chunked bodies, `Expect: 100-continue`.
-- `app.ts` — request dispatcher: REST v3, GraphQL, MCP, git smart HTTP.
-- `store.ts` — the in-memory store (repos, objects, issues, PRs, labels)
+- `app.go` — request dispatcher: REST v3, GraphQL, MCP, git smart HTTP.
+- `store.go` — the in-memory store (repos, objects, issues, PRs)
   plus the memoization caches.
-- `gitcore.ts` — git object model, pkt-line codec, packfile read/write.
-- `graphql.ts` — GraphQL parser + executor for the documents gh and
+- `git.go` — git object model, pkt-line codec, packfile read/write.
+- `graphql.go` — GraphQL parser + executor for the documents gh and
   github-mcp-server send.
-- `mcp.ts` — MCP over JSON-RPC 2.0 (server/discover, initialize,
+- `mcp.go` — MCP over JSON-RPC 2.0 (server/discover, initialize,
   tools/list, tools/call).
+- `json.go` — JSON body parsing / serialization helpers.
 
 ## Performance
 
-Two things make this fast:
-
-1. **Raw TCP transport.** Requests are parsed straight off the socket and
-   each response is written as a single pre-built Buffer. No
-   `node:http` request/response objects, no header object churn.
-2. **Memoization.** Git objects are immutable, so commit/tree parses are
-   cached per oid forever. Each repo carries a generation counter bumped
-   on any mutation; response-level caches are keyed by it and can never
-   go stale:
-   - serialized REST issue/repo JSON (invalidated on mutation),
-   - fetch packs keyed by (generation, plan) — a repeated shallow clone
-     of the same tip is computed once, then served from cache,
-   - v0 ref advertisements keyed by generation.
+Local conformance (`sdk/run.ts --perf`, 3 fresh-server runs): 120/120
+checks, MCP 15/15, perf_p50_us 175,772–198,842 (median ~181k), vs the v3
+Node forge's 187,329–203,904 (median ~191k) on the same machine — about 4%
+faster on the suite's geometric mean, with larger server-side wins per op
+(micro-benchmark: issue read 77 vs 98 us/op, issue write 99 vs 178 us/op,
+info/refs 82 vs 182 us/op). The suite's own client dominates the remaining
+wall time, so the suite-level gain is smaller than the server-side gain.
 
 ## Determinism
 

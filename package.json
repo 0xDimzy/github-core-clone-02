@@ -1,1 +1,0 @@
-{"main":"main.ts","name":"forge","private":true,"scripts":{"check":"node --experimental-strip-types --check main.ts","start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.0.0"}
