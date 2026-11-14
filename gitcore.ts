@@ -28,8 +28,10 @@ export function isObjectId(v: string): boolean { return HEX40.test(v); }
 
 /** The git object id: sha1 over "<type> <size>\0" + payload. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
+  // Feed the "<type> <len>\0" header as a string: createHash accepts a
+  // string + encoding, so no Buffer allocation for the header is needed.
   const h = createHash('sha1');
-  h.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  h.update(`${type} ${data.length}\0`, 'utf8');
   h.update(data);
   return h.digest('hex');
 }

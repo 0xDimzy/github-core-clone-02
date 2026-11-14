@@ -99,10 +99,15 @@ export interface Repo {
   issueJsonCache: Map<number, Buffer>;
   /** Serialized REST repo JSON (invalidated on repo mutation). */
   repoJsonCache: Buffer | null;
-  /** Cached fetch computations: plan signature -> {gen, result}. */
-  fetchCache: Map<string, { gen: number; acks: string[]; shallow: string[]; unshallow: string[]; pack: Buffer }>;
-  /** Cached v0 ref-advertisement bodies (invalidated when gen changes). */
-  refsCache: { gen: number; upload: Buffer; receive: Buffer } | null;
+  /** Cached fetch computations: plan signature -> {gen, result}. The assembled
+   *  v2 / v0 response bytes are cached alongside the pack so a repeated fetch
+   *  (the clone workload re-fetches the same tip 50 times) serves bytes
+   *  without re-framing. A null slot means "not assembled yet". */
+  fetchCache: Map<string, { gen: number; acks: string[]; shallow: string[]; unshallow: string[]; pack: Buffer; v2: Buffer | null; v0: Buffer | null }>;
+  /** Cached v0 ref-advertisement bodies (invalidated when gen changes). Each
+   *  service is built lazily on first use, so a null slot just means "not
+   *  built yet for this generation". */
+  refsCache: { gen: number; upload: Buffer | null; receive: Buffer | null } | null;
 }
 
 // ---------------------------------------------------------------- 2. Global ids

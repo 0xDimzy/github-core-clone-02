@@ -154,15 +154,23 @@ function tryParse(buf: Buffer): { parsed: Parsed } | { sendContinue: true } | nu
   return { parsed: { req, consumed: read.consumed } };
 }
 
+/** Shared empty query params for requests without a query string: handlers
+ *  only read via .get(), so one instance is safe to share. */
+const EMPTY_QUERY = new URLSearchParams();
+
 function buildRequest(method: string, target: string, headers: Map<string, string>, body: Buffer): HttpRequest {
   let path = target;
-  let query = new URLSearchParams();
+  // Fast paths: most requests carry no query string and no percent-escapes,
+  // so skip the URLSearchParams allocation and the decodeURIComponent call.
+  let query: URLSearchParams = EMPTY_QUERY;
   const q = target.indexOf('?');
   if (q >= 0) {
     path = target.slice(0, q);
     query = new URLSearchParams(target.slice(q + 1));
   }
-  try { path = decodeURIComponent(path); } catch { /* keep raw */ }
+  if (path.indexOf('%') >= 0) {
+    try { path = decodeURIComponent(path); } catch { /* keep raw */ }
+  }
   return { method, path, query, headers, body, host: headers.get('host') ?? '127.0.0.1' };
 }
 
@@ -225,18 +233,6 @@ class Connection {
     socket.on('close', () => { this.closed = true; });
   }
 
-  /** Run the application handler for one request, catching its errors into
-   *  a 500 response (and logging the stack to stderr, as before). */
-  private async handleRequest(req: HttpRequest): Promise<HttpResponse> {
-    try {
-      const r = this.handler(req);
-      return r instanceof Promise ? await r : r;
-    } catch (err) {
-      process.stderr.write(`[net] handler error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
-      return internalErrorResponse();
-    }
-  }
-
   /** Write one response, then honor `Connection: close` when asked. */
   private writeResponse(req: HttpRequest, res: HttpResponse): boolean {
     if (this.closed) return false;
@@ -279,7 +275,17 @@ class Connection {
         const { req, consumed } = attempt.parsed;
         this.buf = this.buf.subarray(consumed);
         this.continueSent = false;
-        const res = await this.handleRequest(req);
+        // Run the handler inline. When it is synchronous (the normal case
+        // here) the request is handled and the response written in the same
+        // tick, with no microtask hop from awaiting an async wrapper.
+        let res: HttpResponse;
+        try {
+          const r = this.handler(req);
+          res = r instanceof Promise ? await r : r;
+        } catch (err) {
+          process.stderr.write(`[net] handler error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+          res = internalErrorResponse();
+        }
         if (!this.writeResponse(req, res)) return;
       }
     } finally {

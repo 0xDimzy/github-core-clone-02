@@ -314,21 +314,22 @@ function refLinesV0(forge: Forge, repo: Repo, caps: string): Buffer[] {
 
 /**
  * The v0 ref advertisement body for one service, cached per repo generation.
- * Both services are built and cached together: a client that asks for one
- * usually asks for the other next, and the ref lines are identical.
+ * Only the requested service is built: the push workload bumps the generation
+ * on every push, so building both services here would pay for the unused one
+ * on every info/refs call. The other service is built lazily on first use.
  */
 function refAdvertisement(forge: Forge, repo: Repo, service: 'upload' | 'receive'): Buffer {
   const cached = repo.refsCache;
-  if (cached && cached.gen === repo.gen) return service === 'upload' ? cached.upload : cached.receive;
+  if (cached && cached.gen === repo.gen) {
+    const hit = service === 'upload' ? cached.upload : cached.receive;
+    if (hit) return hit;
+  }
   const caps = service === 'upload' ? UPLOAD_CAPS(repo.defaultBranch) : RECEIVE_CAPS(repo.defaultBranch);
   const svc = service === 'upload' ? '# service=git-upload-pack\n' : '# service=git-receive-pack\n';
   const body = Buffer.concat([pktLine(svc), PKT_FLUSH, ...refLinesV0(forge, repo, caps), PKT_FLUSH]);
-  const otherCaps = service === 'upload' ? RECEIVE_CAPS(repo.defaultBranch) : UPLOAD_CAPS(repo.defaultBranch);
-  const otherSvc = service === 'upload' ? '# service=git-receive-pack\n' : '# service=git-upload-pack\n';
-  const other = Buffer.concat([pktLine(otherSvc), PKT_FLUSH, ...refLinesV0(forge, repo, otherCaps), PKT_FLUSH]);
-  repo.refsCache = service === 'upload'
-    ? { gen: repo.gen, upload: body, receive: other }
-    : { gen: repo.gen, upload: other, receive: body };
+  const cur = cached && cached.gen === repo.gen ? cached : { gen: repo.gen, upload: null as Buffer | null, receive: null as Buffer | null };
+  if (service === 'upload') cur.upload = body; else cur.receive = body;
+  repo.refsCache = cur as { gen: number; upload: Buffer; receive: Buffer };
   return body;
 }
 
@@ -511,15 +512,21 @@ function computeFetchInner(forge: Forge, repo: Repo, plan: FetchPlan): FetchResu
 /**
  * Fetch computation with memoization. The clone workload repeats the same
  * shallow fetch of the same tip 50 times; the pack bytes are identical, so
- * only the first fetch pays the BFS + deflate cost.
+ * only the first fetch pays the BFS + deflate cost. The plan key also drives
+ * the assembled-response cache in the fetch-response builders.
  */
-function computeFetch(forge: Forge, repo: Repo, plan: FetchPlan): FetchResult {
-  const key = `${plan.wants.join(',')}|${plan.haves.join(',')}|${plan.shallowIn.join(',')}|${plan.deepen ?? ''}`;
+function fetchCacheKey(plan: FetchPlan): string {
+  return `${plan.wants.join(',')}|${plan.haves.join(',')}|${plan.shallowIn.join(',')}|${plan.deepen ?? ''}`;
+}
+
+function computeFetch(forge: Forge, repo: Repo, plan: FetchPlan): { gen: number; acks: string[]; shallow: string[]; unshallow: string[]; pack: Buffer; v2: Buffer | null; v0: Buffer | null } {
+  const key = fetchCacheKey(plan);
   const cached = repo.fetchCache.get(key);
   if (cached && cached.gen === repo.gen) return cached;
   const result = computeFetchInner(forge, repo, plan);
-  repo.fetchCache.set(key, { gen: repo.gen, ...result });
-  return result;
+  const entry = { gen: repo.gen, ...result, v2: null as Buffer | null, v0: null as Buffer | null };
+  repo.fetchCache.set(key, entry);
+  return entry;
 }
 
 // ---------------------------------------------------------------- fetch responses
@@ -527,26 +534,34 @@ function computeFetch(forge: Forge, repo: Repo, plan: FetchPlan): FetchResult {
 /**
  * The v0 fetch response body: one ACK per have the server recognizes (or a
  * single NAK when none match), then the shallow / unshallow lines, then the
- * pack on sideband 1, closed by a flush.
+ * pack on sideband 1, closed by a flush. The assembled bytes are cached per
+ * (plan, generation) so a repeated fetch serves them without re-framing.
  */
 function buildV0FetchResponse(forge: Forge, repo: Repo, plan: FetchPlan): Buffer {
-  const { acks, shallow, unshallow, pack } = computeFetch(forge, repo, plan);
+  const cached = computeFetch(forge, repo, plan);
+  if (cached.v0) return cached.v0;
+  const { acks, shallow, unshallow, pack } = cached;
   const out: Buffer[] = [];
   if (acks.length) for (const ack of acks) out.push(pktLine(`ACK ${ack}\n`));
   else out.push(pktLine('NAK\n'));
   for (const oid of shallow) out.push(pktLine(`shallow ${oid}\n`));
   for (const oid of unshallow) out.push(pktLine(`unshallow ${oid}\n`));
   out.push(...sidebandChunks(pack), PKT_FLUSH);
-  return Buffer.concat(out);
+  const body = Buffer.concat(out);
+  cached.v0 = body;
+  return body;
 }
 
 /**
  * The v2 `fetch` response body: an `acknowledgments` section (only when the
  * client sent haves), a `shallow-info` section (only when there is something
  * to report), then the `packfile` section with the pack on sideband 1.
+ * The assembled bytes are cached per (plan, generation).
  */
 function buildV2FetchResponse(forge: Forge, repo: Repo, plan: FetchPlan): Buffer {
-  const { acks, shallow, unshallow, pack } = computeFetch(forge, repo, plan);
+  const cached = computeFetch(forge, repo, plan);
+  if (cached.v2) return cached.v2;
+  const { acks, shallow, unshallow, pack } = cached;
   const out: Buffer[] = [];
   if (plan.haves.length > 0) {
     out.push(pktLine('acknowledgments\n'));
@@ -561,7 +576,9 @@ function buildV2FetchResponse(forge: Forge, repo: Repo, plan: FetchPlan): Buffer
     out.push(PKT_FLUSH);
   }
   out.push(pktLine('packfile\n'), ...sidebandChunks(pack), PKT_FLUSH);
-  return Buffer.concat(out);
+  const body = Buffer.concat(out);
+  cached.v2 = body;
+  return body;
 }
 
 interface LsRefsOptions { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[]; }
@@ -687,7 +704,7 @@ function handle(req: HttpRequest, forge: Forge): HttpResponse {
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1].endsWith('.git')) {
-    return handleGit(req, forge, method);
+    return handleGit(req, forge, method, segments);
   }
 
   // GraphQL.
@@ -1253,8 +1270,7 @@ function handlePullMerge(req: HttpRequest, forge: Forge, repo: Repo, pull: Pull,
  * authenticated), then the repo is resolved, then the sub-path picks the
  * handler: info/refs advertisement, upload-pack, or receive-pack.
  */
-function handleGit(req: HttpRequest, forge: Forge, method: string): HttpResponse {
-  const segments = req.path.split('/').filter((s) => s !== '');
+function handleGit(req: HttpRequest, forge: Forge, method: string, segments: string[]): HttpResponse {
   const owner = segments[0];
   const repoName = segments[1].slice(0, -'.git'.length);
   const sub = segments.slice(2);
